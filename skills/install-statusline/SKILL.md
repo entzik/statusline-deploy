@@ -102,13 +102,17 @@ After installation, the status line configuration lives in `~/.claude/settings.j
 - Shows dirty status with asterisk (`*`) when uncommitted changes exist
 - Displays ahead/behind counts relative to tracking branch (↑/↓)
 - Handles detached HEAD states by showing short commit hash
+- Branch name links (OSC 8) to the branch's page on GitHub (`/tree/<branch>`) or GitLab (`/-/tree/<branch>`); no link for detached HEAD or unrecognized hosts
 
 ### GitHub PR & GitLab MR Status
 - **Auto-detection:** Automatically detects GitHub or GitLab repositories
 - **GitHub:** Shows PR number (e.g., `#123`) when on a branch with an active PR
 - **GitLab:** Shows MR number (e.g., `!456`) when on a branch with an active MR
 - Displays PR/MR state (open, merged, closed) with color coding
-- Indicates draft status and check/pipeline state (running, failed, pending)
+- PR/MR number is a clickable OSC 8 hyperlink to the PR/MR page (terminals that don't support OSC 8 just show the plain number)
+- Indicates draft status, approval state, and check pass counts (e.g. `3/4 checks pending`)
+  - GitHub: review decision (approved/changes requested/review required)
+  - GitLab: approval state (approved/review required) plus per-job pipeline counts, via extra `glab api` calls
 - Uses intelligent caching (90-second TTL) to minimize network calls
 - Spawns detached refresh process when cache expires, never blocking renders
 

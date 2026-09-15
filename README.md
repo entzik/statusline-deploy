@@ -40,12 +40,15 @@ This will:
 - Displays dirty status (`*` when changes exist)
 - Shows ahead/behind tracking with branch
 - Works with detached HEAD states
+- Branch name is a clickable link to its GitHub/GitLab branch page (terminals supporting OSC 8 hyperlinks)
 
 ### GitHub PR & GitLab MR Status
 - **Auto-detection:** Automatically detects GitHub or GitLab repositories
-- **GitHub:** Displays PR number (e.g., `#123`) with status
-- **GitLab:** Displays MR number (e.g., `!456`) with status
-- Shows draft status and check/pipeline state
+- **GitHub:** Displays PR number (e.g., `#123`) with status, clickable to open the PR (terminals supporting OSC 8 hyperlinks)
+- **GitLab:** Displays MR number (e.g., `!456`) with status, clickable to open the MR (terminals supporting OSC 8 hyperlinks)
+- Shows draft status, approval state, and check counts (e.g. `3/4 checks pending`)
+  - GitHub: review decision (approved/changes requested/review required) from `gh pr view`
+  - GitLab: approval state (approved/review required) from `glab api .../approvals`, and per-job pipeline counts from `glab api .../pipelines/:id/jobs`
 - Caches results to minimize API calls
 - Supports self-hosted GitLab via `CLAUDE_STATUSLINE_GITLAB_HOSTS` env var
 

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 
 RESET, DIM, BOLD = "\033[0m", "\033[2m", "\033[1m"
 BLUE = "\033[38;5;75m"
@@ -32,7 +33,10 @@ SEP = f"{GREY} │ {RESET}"
 BLOCK = f"{GREY} ----- {RESET}"
 
 PR_TTL = 90          # seconds a cached PR/MR answer stays fresh
-PR_REFRESH_LOCK = 20  # min seconds between spawned refreshes
+PR_REFRESH_LOCK = 45  # min seconds between spawned refreshes -- must exceed the
+                       # worst-case refresh latency (gh: ~15s; glab: up to ~35s
+                       # across mr view + pipeline jobs + approvals) or a slow
+                       # refresh can overlap with a newly spawned one
 RES_TTL = 2          # seconds a cached resource snapshot stays fresh
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "claude-statusline")
 RES_CACHE = os.path.join(CACHE_DIR, "resources.json")
@@ -114,10 +118,18 @@ def bar(pct, width=8):
     return "█" * filled + "░" * (width - filled)
 
 
+def hyperlink(text, url):
+    """Wrap text in an OSC 8 terminal hyperlink. Terminals without OSC 8
+    support just render the plain text, so this degrades safely."""
+    if not url:
+        return text
+    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
+
+
 def fetch_resources():
     """Fetch CPU and memory stats from system.
     Returns (cpu_pct, mem_pct, mem_used_mb, mem_total_mb) or (None, None, None, None).
-    Uses sysctl for true total RAM to avoid top's accounting differences.
+    Supports both macOS and Linux with fallback parsing.
     """
     try:
         import psutil
@@ -129,11 +141,20 @@ def fetch_resources():
     except (ImportError, Exception):
         pass
 
+    system = sys.platform
+    if system == "darwin":
+        return _fetch_resources_macos()
+    elif system.startswith("linux"):
+        return _fetch_resources_linux()
+    return None, None, None, None
+
+
+def _fetch_resources_macos():
+    """Fetch resources on macOS using top and sysctl."""
     out = run("top", "-l", "1", "-n", "0", timeout=2)
     if not out:
         return None, None, None, None
 
-    # Get true physical RAM from sysctl (more reliable than top's total)
     total_bytes_str = run("sysctl", "-n", "hw.memsize")
     total_mb = None
     if total_bytes_str:
@@ -157,6 +178,61 @@ def fetch_resources():
     if mem_used_mb is not None and total_mb is not None:
         mem_pct = int(round(mem_used_mb / total_mb * 100))
         return cpu, mem_pct, mem_used_mb, total_mb
+    return cpu, None, None, None
+
+
+def _read_proc_stat_jiffies():
+    """Return (total, idle) cumulative jiffies from /proc/stat's first line."""
+    with open("/proc/stat", "r") as f:
+        fields = f.readline().split()[1:8]
+    user, nice, system, idle = (int(fields[i]) for i in range(4))
+    iowait = int(fields[4]) if len(fields) > 4 else 0
+    return user + nice + system + idle + iowait, idle
+
+
+def _linux_cpu_percent():
+    """CPU% from two /proc/stat samples -- a single read is cumulative since
+    boot, not current load, and would barely move on a long-uptime machine."""
+    try:
+        total1, idle1 = _read_proc_stat_jiffies()
+        time.sleep(0.1)
+        total2, idle2 = _read_proc_stat_jiffies()
+        dtotal, didle = total2 - total1, idle2 - idle1
+        if dtotal <= 0:
+            return None
+        return int(round(100 * (dtotal - didle) / dtotal))
+    except Exception:
+        return None
+
+
+def _fetch_resources_linux():
+    """Fetch resources on Linux using /proc filesystem."""
+    mem_used_mb, mem_total_mb = None, None
+    cpu = _linux_cpu_percent()
+
+    try:
+        with open("/proc/meminfo", "r") as f:
+            meminfo = {}
+            for line in f:
+                key, val = line.split(":", 1)
+                meminfo[key.strip()] = int(val.split()[0])
+            mem_total_mb = meminfo.get("MemTotal", 0) // 1024
+            if "MemAvailable" in meminfo:
+                mem_available_mb = meminfo["MemAvailable"] // 1024
+            else:
+                # Pre-3.14 kernels / minimal containers lack MemAvailable;
+                # fall back to the classic free+buffers+cached approximation
+                # instead of silently treating unavailable as 0 (~100% used).
+                mem_available_mb = (meminfo.get("MemFree", 0) +
+                                     meminfo.get("Buffers", 0) +
+                                     meminfo.get("Cached", 0)) // 1024
+            mem_used_mb = mem_total_mb - mem_available_mb
+            if mem_total_mb > 0:
+                mem_pct = int(round(100 * mem_used_mb / mem_total_mb))
+                return cpu, mem_pct, mem_used_mb, mem_total_mb
+    except Exception:
+        pass
+
     return cpu, None, None, None
 
 
@@ -235,9 +311,54 @@ def gitlab_host(repo, cwd):
     return host if ("gitlab" in host or host in extra) else None
 
 
+def branch_url(repo, cwd, branch):
+    """URL to the tracked branch's page on GitHub or GitLab, or None."""
+    if not branch or branch.startswith("@"):
+        return None
+    owner, name = (repo or {}).get("owner"), (repo or {}).get("name")
+    if not owner or not name:
+        return None
+
+    gh_host = github_host(repo, cwd)
+    gl_host = gitlab_host(repo, cwd)
+    if not gh_host and not gl_host:
+        return None
+
+    host = gh_host or gl_host
+    ref = urllib.parse.quote(branch, safe="/")
+    if gh_host:
+        return f"https://{host}/{owner}/{name}/tree/{ref}"
+    return f"https://{host}/{owner}/{name}/-/tree/{ref}"
+
+
 def pr_cache_path(root, branch, prefix="pr"):
     key = hashlib.sha1(f"{root}\0{branch}".encode()).hexdigest()[:16]
     return os.path.join(CACHE_DIR, f"{prefix}-{key}.json")
+
+
+def summarize_checks(statuses):
+    """Roll up a list of raw check states into {overall, passed, total}.
+
+    `statuses` may hold GitHub CheckRun conclusions (SUCCESS, FAILURE, ...),
+    CheckRun statuses (QUEUED, IN_PROGRESS, ...), legacy StatusContext states
+    (SUCCESS, ERROR, PENDING, ...), or GitLab pipeline/job statuses (success,
+    failed, running, created, manual, ...).
+    """
+    if not statuses:
+        return None
+    passed = failed = pending = 0
+    for raw in statuses:
+        s = (raw or "").upper()
+        if s == "SUCCESS":
+            passed += 1
+        elif s in ("FAILURE", "FAILED", "ERROR", "CANCELLED", "CANCELED", "TIMED_OUT", "ACTION_REQUIRED"):
+            failed += 1
+        elif s in ("PENDING", "QUEUED", "IN_PROGRESS", "EXPECTED", "RUNNING", "CREATED", "MANUAL", "SCHEDULED"):
+            pending += 1
+        else:
+            passed += 1  # NEUTRAL, SKIPPED, STALE -- don't penalize
+    overall = "failed" if failed else "pending" if pending else "success"
+    return {"overall": overall, "passed": passed, "total": len(statuses)}
 
 
 def fetch_pr(cwd, cache_path, tool):
@@ -248,36 +369,68 @@ def fetch_pr(cwd, cache_path, tool):
         if out:
             try:
                 d = json.loads(out)
+                iid = d.get("iid")
+                pipeline = (d.get("head_pipeline") or d.get("pipeline") or {}) or {}
+
+                checks = None
+                pipeline_id = pipeline.get("id")
+                if pipeline_id:
+                    jobs_out = run("glab", "api", f"projects/:id/pipelines/{pipeline_id}/jobs",
+                                    cwd=cwd, timeout=10)
+                    if jobs_out:
+                        try:
+                            jobs = json.loads(jobs_out)
+                            checks = summarize_checks([j.get("status") for j in jobs])
+                        except Exception:
+                            pass
+                if checks is None and pipeline.get("status"):
+                    checks = summarize_checks([pipeline["status"]])
+
+                review = None
+                if iid:
+                    appr_out = run("glab", "api", f"projects/:id/merge_requests/{iid}/approvals",
+                                    cwd=cwd, timeout=10)
+                    if appr_out:
+                        try:
+                            a = json.loads(appr_out)
+                            if a.get("approved"):
+                                review = "approved"
+                            elif (a.get("approvals_left") or 0) > 0:
+                                review = "review_required"
+                        except Exception:
+                            pass
+
+                state = d.get("state") or ""
+                if state == "opened":  # GitLab says "opened"; GitHub says "open" -- normalize
+                    state = "open"
                 pr = {
-                    "number": d.get("iid"),
-                    "state": d.get("state"),
+                    "number": iid,
+                    "state": state,
                     "draft": bool(d.get("draft") or d.get("work_in_progress")),
-                    "check": ((d.get("head_pipeline") or d.get("pipeline") or {}) or {}).get("status"),
+                    "checks": checks,
+                    "review": review,
+                    "url": d.get("web_url"),
                 }
                 if not pr["number"]:
                     pr = None
             except Exception:
                 pass
     elif tool == "gh":
-        out = run("gh", "pr", "view", "--json", "number,state,isDraft,statusCheckRollup", cwd=cwd, timeout=15)
+        out = run("gh", "pr", "view",
+                   "--json", "number,state,isDraft,statusCheckRollup,reviewDecision,url",
+                   cwd=cwd, timeout=15)
         if out:
             try:
                 d = json.loads(out)
-                checks = d.get("statusCheckRollup", [])
-                check_state = None
-                if checks:
-                    states = [c.get("status") for c in checks if c.get("status")]
-                    if "FAILURE" in states:
-                        check_state = "failed"
-                    elif "PENDING" in states:
-                        check_state = "pending"
-                    elif all(s == "SUCCESS" for s in states):
-                        check_state = "success"
+                checks = d.get("statusCheckRollup") or []
+                statuses = [c.get("conclusion") or c.get("state") or c.get("status") for c in checks]
                 pr = {
                     "number": d.get("number"),
                     "state": d.get("state", "").lower(),
                     "draft": d.get("isDraft", False),
-                    "check": check_state,
+                    "checks": summarize_checks(statuses),
+                    "review": (d.get("reviewDecision") or "").lower() or None,
+                    "url": d.get("url"),
                 }
                 if not pr["number"]:
                     pr = None
@@ -339,15 +492,28 @@ def pr_segment(repo, cwd, branch):
         return None
 
     label = f"#{number}" if is_github else f"!{number}"
+    url = cached.get("url")
+    if url:
+        label = hyperlink(label, url)
     color = GREEN if state == "merged" else RED if state == "closed" else ORANGE
     bits = []
     if cached.get("draft"):
         bits.append("draft")
     if state and state != "open":
         bits.append(state)
-    check = cached.get("check")
-    if check in ("failed", "pending", "success"):
-        bits.append(check)
+    review = cached.get("review")
+    if review == "approved":
+        bits.append("approved")
+    elif review == "changes_requested":
+        bits.append("changes requested")
+    elif review == "review_required":
+        bits.append("review required")
+    checks = cached.get("checks")
+    if checks:
+        label_c = f"{checks['passed']}/{checks['total']} checks"
+        if checks["overall"] != "success":
+            label_c += f" {checks['overall']}"
+        bits.append(label_c)
     suffix = f" {DIM}{' · '.join(bits)}{RESET}" if bits else ""
     stale = f"{DIM}~{RESET}" if age and age > PR_TTL * 4 else ""
     return f"{color}{label}{RESET}{suffix}{stale}"
@@ -422,7 +588,8 @@ def line_two(data, home):
         if ahead or behind:
             track = (f" {DIM}" + (f"↑{ahead}" if ahead else "") +
                      (f"↓{behind}" if behind else "") + RESET)
-        segs.append(f"{MAGENTA}⎇ {branch}{RESET}{mark}{track}")
+        branch_label = hyperlink(branch, branch_url(repo, cwd, branch))
+        segs.append(f"{MAGENTA}⎇ {branch_label}{RESET}{mark}{track}")
 
     pr = pr_segment(repo, cwd, branch)
     if pr:
