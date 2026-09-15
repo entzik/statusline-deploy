@@ -33,7 +33,10 @@ SEP = f"{GREY} │ {RESET}"
 BLOCK = f"{GREY} ----- {RESET}"
 
 PR_TTL = 90          # seconds a cached PR/MR answer stays fresh
-PR_REFRESH_LOCK = 20  # min seconds between spawned refreshes
+PR_REFRESH_LOCK = 45  # min seconds between spawned refreshes -- must exceed the
+                       # worst-case refresh latency (gh: ~15s; glab: up to ~35s
+                       # across mr view + pipeline jobs + approvals) or a slow
+                       # refresh can overlap with a newly spawned one
 RES_TTL = 2          # seconds a cached resource snapshot stays fresh
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "claude-statusline")
 RES_CACHE = os.path.join(CACHE_DIR, "resources.json")
@@ -178,24 +181,34 @@ def _fetch_resources_macos():
     return cpu, None, None, None
 
 
+def _read_proc_stat_jiffies():
+    """Return (total, idle) cumulative jiffies from /proc/stat's first line."""
+    with open("/proc/stat", "r") as f:
+        fields = f.readline().split()[1:8]
+    user, nice, system, idle = (int(fields[i]) for i in range(4))
+    iowait = int(fields[4]) if len(fields) > 4 else 0
+    return user + nice + system + idle + iowait, idle
+
+
+def _linux_cpu_percent():
+    """CPU% from two /proc/stat samples -- a single read is cumulative since
+    boot, not current load, and would barely move on a long-uptime machine."""
+    try:
+        total1, idle1 = _read_proc_stat_jiffies()
+        time.sleep(0.1)
+        total2, idle2 = _read_proc_stat_jiffies()
+        dtotal, didle = total2 - total1, idle2 - idle1
+        if dtotal <= 0:
+            return None
+        return int(round(100 * (dtotal - didle) / dtotal))
+    except Exception:
+        return None
+
+
 def _fetch_resources_linux():
     """Fetch resources on Linux using /proc filesystem."""
-    cpu, mem_used_mb, mem_total_mb = None, None, None
-
-    try:
-        with open("/proc/stat", "r") as f:
-            cpu_line = f.readline()
-            fields = cpu_line.split()[1:8]
-            user = int(fields[0])
-            nice = int(fields[1])
-            system = int(fields[2])
-            idle = int(fields[3])
-            iowait = int(fields[4]) if len(fields) > 4 else 0
-            total = user + nice + system + idle + iowait
-            if total > 0:
-                cpu = int(round(100 * (total - idle) / total))
-    except Exception:
-        pass
+    mem_used_mb, mem_total_mb = None, None
+    cpu = _linux_cpu_percent()
 
     try:
         with open("/proc/meminfo", "r") as f:
@@ -204,7 +217,15 @@ def _fetch_resources_linux():
                 key, val = line.split(":", 1)
                 meminfo[key.strip()] = int(val.split()[0])
             mem_total_mb = meminfo.get("MemTotal", 0) // 1024
-            mem_available_mb = meminfo.get("MemAvailable", 0) // 1024
+            if "MemAvailable" in meminfo:
+                mem_available_mb = meminfo["MemAvailable"] // 1024
+            else:
+                # Pre-3.14 kernels / minimal containers lack MemAvailable;
+                # fall back to the classic free+buffers+cached approximation
+                # instead of silently treating unavailable as 0 (~100% used).
+                mem_available_mb = (meminfo.get("MemFree", 0) +
+                                     meminfo.get("Buffers", 0) +
+                                     meminfo.get("Cached", 0)) // 1024
             mem_used_mb = mem_total_mb - mem_available_mb
             if mem_total_mb > 0:
                 mem_pct = int(round(100 * mem_used_mb / mem_total_mb))
