@@ -117,7 +117,7 @@ def bar(pct, width=8):
 def fetch_resources():
     """Fetch CPU and memory stats from system.
     Returns (cpu_pct, mem_pct, mem_used_mb, mem_total_mb) or (None, None, None, None).
-    Uses sysctl for true total RAM to avoid top's accounting differences.
+    Supports both macOS and Linux with fallback parsing.
     """
     try:
         import psutil
@@ -129,11 +129,20 @@ def fetch_resources():
     except (ImportError, Exception):
         pass
 
+    system = sys.platform
+    if system == "darwin":
+        return _fetch_resources_macos()
+    elif system.startswith("linux"):
+        return _fetch_resources_linux()
+    return None, None, None, None
+
+
+def _fetch_resources_macos():
+    """Fetch resources on macOS using top and sysctl."""
     out = run("top", "-l", "1", "-n", "0", timeout=2)
     if not out:
         return None, None, None, None
 
-    # Get true physical RAM from sysctl (more reliable than top's total)
     total_bytes_str = run("sysctl", "-n", "hw.memsize")
     total_mb = None
     if total_bytes_str:
@@ -157,6 +166,43 @@ def fetch_resources():
     if mem_used_mb is not None and total_mb is not None:
         mem_pct = int(round(mem_used_mb / total_mb * 100))
         return cpu, mem_pct, mem_used_mb, total_mb
+    return cpu, None, None, None
+
+
+def _fetch_resources_linux():
+    """Fetch resources on Linux using /proc filesystem."""
+    cpu, mem_used_mb, mem_total_mb = None, None, None
+
+    try:
+        with open("/proc/stat", "r") as f:
+            cpu_line = f.readline()
+            fields = cpu_line.split()[1:8]
+            user = int(fields[0])
+            nice = int(fields[1])
+            system = int(fields[2])
+            idle = int(fields[3])
+            iowait = int(fields[4]) if len(fields) > 4 else 0
+            total = user + nice + system + idle + iowait
+            if total > 0:
+                cpu = int(round(100 * (total - idle) / total))
+    except Exception:
+        pass
+
+    try:
+        with open("/proc/meminfo", "r") as f:
+            meminfo = {}
+            for line in f:
+                key, val = line.split(":", 1)
+                meminfo[key.strip()] = int(val.split()[0])
+            mem_total_mb = meminfo.get("MemTotal", 0) // 1024
+            mem_available_mb = meminfo.get("MemAvailable", 0) // 1024
+            mem_used_mb = mem_total_mb - mem_available_mb
+            if mem_total_mb > 0:
+                mem_pct = int(round(100 * mem_used_mb / mem_total_mb))
+                return cpu, mem_pct, mem_used_mb, mem_total_mb
+    except Exception:
+        pass
+
     return cpu, None, None, None
 
 
