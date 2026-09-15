@@ -1,0 +1,10 @@
+{
+  "name": "statusline-deploy",
+  "version": "0.1.0",
+  "description": "Install and deploy a custom Claude Code status line to your machine",
+  "author": {
+    "name": "Entzik",
+    "email": "entzik@gmail.com"
+  },
+  "keywords": ["statusline", "status-bar", "deployment", "configuration"]
+}
